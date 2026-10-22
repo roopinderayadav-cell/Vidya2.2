@@ -1,11 +1,37 @@
-# Vidya v5.2 - Your AI Learning & Knowledge Assistant (NORAM · EUROPE · APAC)
+# Vidya v5.3 - Your AI Learning & Knowledge Assistant (NORAM · EUROPE · APAC)
 
 Vidya is the team's AI knowledge assistant (formerly iKnow / OpsMate). Agents ask questions in
 plain words (typos and Hindi/Kannada/Telugu in English letters are fine) or paste a screenshot,
 and get one short answer with its SOP source and a confidence level. When Vidya is not sure it
 says: "I do not have answer to this question, please consult with your team supervisor."
 
-## What's new in Vidya v5.2 - new look and the Fare Rule Reader
+## What's new in Vidya v5.3 - admin approval, voting rule, reports & logs
+- **Nothing enters Vidya's memory without an admin.** SME answers, live-chat answers, "Vidya's answer is
+  right" confirmations, SME edits of existing answers and answers staff voted good all wait on
+  **Admin → Approvals** (approve / approve with edits / reject with a reason). Vidya uses an answer only
+  after it is approved. Admins adding an answer themselves are logged as submitter and approver.
+- **SME replies reach the agent at once.** On the SME Desk an SME chooses **Reply + send to admin for Vidya**
+  or **Reply to agent only** (Vidya's memory is not changed). The agent sees "An SME answered N of your
+  questions" on Ask Vidya and the full answer under My Questions. SMEs see what they sent and the admin's
+  decision under SME Desk → Sent for approval.
+- **One voting rule for good AND bad** (config.py): at least `FEEDBACK_MIN_VOTES` = 10 different agents,
+  `FEEDBACK_AGREE_PCT` = 80 % of all votes on one side, and `FEEDBACK_MIN_SME_VOTES` = 2 SMEs on that side.
+  Good → the answer is sent to the admin for approval and its source moves up in search. Bad → a learned
+  answer is switched off and a document passage moves down. Below the rule, votes change nothing either
+  way. Every 👎 still sends the question to the SME Desk at once, so a person always looks at it.
+- **Reports & Logs** (SMEs and admins): activity log of every action - sign-in (with role), question asked,
+  document uploaded / changed / archived / deleted (who and when), SME reply, sent for approval, approved,
+  rejected, feedback 👍/👎, live chats, announcements, gap updates, LOB changes, backup restore - plus
+  Documents (who uploaded what, when), Approvals log, Votes per answer with the rule result, and SME activity.
+  One Excel export with all sheets. Card numbers are masked in the log too.
+- **SMEs now have the Dashboard** (and Reports & Logs). Admin-only: Approvals, Document Management,
+  Review Queue, Knowledge Gaps, Learned Answers, Settings.
+- Fare Rule Reader check 3 wording fixed: "for no show, cancellation by airline or voluntary".
+- New look images: the Vidya robot in the yellow hoodie (header, banner, chat avatar, browser tab).
+- Existing databases upgrade by themselves (new columns and the activity-log table are added; existing
+  learned answers stay approved and in use).
+
+## Vidya v5.2 - new look and the Fare Rule Reader
 - **New look:** the Vidya robot in the header (round icon), the welcome banner with the robot reading,
   tagline "Your AI Learning & Knowledge Assistant", the robot as chat avatar and browser-tab icon. No plane
   anywhere. Images: `assets/vidya_icon.png` (tab / avatar), `assets/vidya_icon.webp` (header),

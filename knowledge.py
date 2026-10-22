@@ -118,6 +118,17 @@ def init_db():
         _add_cols(con, "learned", [("source", "TEXT DEFAULT 'verified'"),
                                    ("active", "INTEGER DEFAULT 1"), ("votes", "INTEGER DEFAULT 0"),
                                    ("embedding", "BLOB"), ("lob", "TEXT DEFAULT ''")])
+        # v5.3 - admin approval before anything enters Vidya's memory, SME replies, votes, activity log
+        _add_cols(con, "learned", [("status", "TEXT DEFAULT 'approved'"), ("kind", "TEXT DEFAULT ''"),
+                                   ("submitted_by", "TEXT"), ("submitted_at", "TEXT"),
+                                   ("decided_by", "TEXT"), ("decided_at", "TEXT"),
+                                   ("decision_note", "TEXT"), ("replaces", "INTEGER"),
+                                   ("vote_info", "TEXT"), ("question_ids", "TEXT")])
+        _add_cols(con, "questions", [("sme_reply", "TEXT"), ("sme_reply_by", "TEXT"), ("sme_reply_at", "TEXT"),
+                                     ("sme_reply_seen", "INTEGER DEFAULT 0"), ("feedback_role", "TEXT")])
+        _add_cols(con, "feedback_pairs", [("voter", "TEXT"), ("role", "TEXT"), ("qid", "INTEGER")])
+        con.execute("CREATE TABLE IF NOT EXISTS audit_log (id INTEGER PRIMARY KEY AUTOINCREMENT, at TEXT, "
+                    "user TEXT, role TEXT, action TEXT, region TEXT, item TEXT, detail TEXT)")
 
 
 # ---------------------------------------------------------------------------
@@ -138,7 +149,7 @@ def get_lobs():
     return {r: stored.get(r, list(config.DEFAULT_LOBS.get(r, []))) for r in config.REGIONS}
 
 
-def save_lobs(lobs):
+def save_lobs(lobs, by=""):
     """lobs = {LOB: [sub-LOB, ...]} for the LOB tabs in config.REGIONS. Sub-LOB names are trimmed,
     blanks and duplicates dropped."""
     clean = {}
@@ -158,14 +169,20 @@ def save_lobs(lobs):
     with _conn() as con:
         con.execute("INSERT INTO app_settings (key, value) VALUES ('lobs', ?) "
                     "ON CONFLICT(key) DO UPDATE SET value=excluded.value", (json.dumps(merged),))
+    if by:
+        log(by, "LOB / sub-LOB list changed", ", ".join(clean), json.dumps(clean)[:900])
     return merged
 
 
-def update_document_tags(doc_id, sub_lob="", effective_date=None):
+def update_document_tags(doc_id, sub_lob="", effective_date=None, by=""):
     with _conn() as con:
         con.execute("UPDATE documents SET sub_lob=? WHERE id=?", (sub_lob or "", doc_id))
         if effective_date is not None:
             con.execute("UPDATE documents SET effective_date=? WHERE id=?", (effective_date or None, doc_id))
+        r = con.execute("SELECT title, region FROM documents WHERE id=?", (doc_id,)).fetchone()
+    if r:
+        log(by, "Document details changed", r["title"],
+            f"sub-LOB {sub_lob or 'General'}" + (f" · effective {effective_date}" if effective_date else ""), r["region"])
 
 
 def _now():
@@ -500,6 +517,8 @@ def add_document(region, doc_type, title, filename, data: bytes, uploaded_by, ve
         con.execute("UPDATE documents SET chunks=? WHERE id=?", (len(pieces), doc_id))
     stored_images = store_images(doc_id, images)
     rechecked = recheck_gaps(region, doc_title=title or filename)
+    log(uploaded_by, "Document uploaded", title or filename,
+        f"{filename} · {doc_type} · v{version or '-'} · sub-LOB {sub_lob or 'General'} · {len(pieces)} pieces", region)
     return doc_id, len(pieces), {"images_found": len(images), "images_read": len(image_parts),
                                  "images_stored": stored_images,
                                  "images_skipped": skipped, "semantic": semantic,
@@ -734,13 +753,15 @@ def answer_images(hits, limit=None):
     return out
 
 
-def delete_document(doc_id):
+def delete_document(doc_id, by=""):
     with _conn() as con:
-        row = con.execute("SELECT stored_path FROM documents WHERE id=?", (doc_id,)).fetchone()
+        row = con.execute("SELECT stored_path, title, filename, region FROM documents WHERE id=?",
+                          (doc_id,)).fetchone()
         con.execute("DELETE FROM chunks WHERE doc_id=?", (doc_id,))
         con.execute("DELETE FROM documents WHERE id=?", (doc_id,))
     _delete_images(doc_id)
     if row:
+        log(by, "Document deleted", row["title"], row["filename"], row["region"])
         try:
             from pathlib import Path
             Path(row["stored_path"]).unlink(missing_ok=True)
@@ -748,10 +769,13 @@ def delete_document(doc_id):
             pass
 
 
-def set_document_status(doc_id, status):
+def set_document_status(doc_id, status, by=""):
     """Active documents are searched; Archived ones are kept but ignored."""
     with _conn() as con:
         con.execute("UPDATE documents SET status=? WHERE id=?", (status, doc_id))
+        r = con.execute("SELECT title, region FROM documents WHERE id=?", (doc_id,)).fetchone()
+    if r:
+        log(by, f"Document set to {status}", r["title"], "", r["region"])
 
 
 def list_documents(region=None, include_global=True, status=None):
@@ -913,7 +937,8 @@ def _load_candidates(region, all_regions=False):
             f"WHERE c.region IN ({marks}) AND COALESCE(d.status,'Active')='Active'", regions).fetchall()
         learned = con.execute(
             "SELECT id, question, answer, added_by, added_at, region, source, embedding, lob, variants FROM learned "
-            f"WHERE region IN ({marks}) AND COALESCE(active,1)=1", regions).fetchall()
+            f"WHERE region IN ({marks}) AND COALESCE(active,1)=1 AND COALESCE(status,'approved')='approved'",
+            regions).fetchall()
     items = [
         {"kind": "doc", "text": r["text"], "title": r["title"], "type": r["doc_type"],
          "location": r["location"], "region": r["region"], "version": r["version"],
@@ -953,21 +978,30 @@ def _norm(text):
 
 
 def _feedback_multipliers(region, query):
-    """SELF-LEARNING: passages staff marked 👍 / 👎 for SIMILAR questions are
-    moved up (x1.3 per vote, max x1.9) or down (x0.5 per vote)."""
+    """SELF-LEARNING with the voting rule: passages staff rated for SIMILAR questions move up
+    (FEEDBACK_GOOD_BOOST) or down (FEEDBACK_BAD_FACTOR) ONLY once the rule is met - at least
+    FEEDBACK_MIN_VOTES agents, FEEDBACK_AGREE_PCT % on one side and FEEDBACK_MIN_SME_VOTES SMEs agreeing.
+    Fewer votes change nothing, for good or bad."""
     with _conn() as con:
-        rows = con.execute("SELECT question, source_key, value FROM feedback_pairs "
-                           "WHERE region IN (?,?)", (region, config.GLOBAL_REGION)).fetchall()
+        rows = [dict(r) for r in con.execute(
+            "SELECT id, question, source_key, value, voter, role FROM feedback_pairs "
+            "WHERE region IN (?,?)", (region, config.GLOBAL_REGION))]
     if not rows:
         return {}
     texts = [r["question"] for r in rows]
     vec = TfidfVectorizer(analyzer="char_wb", ngram_range=(3, 5)).fit(texts + [query])
     sims = cosine_similarity(vec.transform([query]), vec.transform(texts)).ravel()
-    mult = {}
+    by_key = {}
     for r, s in zip(rows, sims):
         if s >= config.FEEDBACK_SIMILARITY:
-            m = mult.get(r["source_key"], 1.0)
-            mult[r["source_key"]] = min(1.9, m * 1.3) if r["value"] > 0 else m * 0.5
+            by_key.setdefault(r["source_key"], []).append(r)
+    mult = {}
+    for key, rs in by_key.items():
+        verdict = vote_verdict(vote_counts(rs))
+        if verdict == "good":
+            mult[key] = config.FEEDBACK_GOOD_BOOST
+        elif verdict == "bad":
+            mult[key] = config.FEEDBACK_BAD_FACTOR
     return mult
 
 
@@ -1889,14 +1923,19 @@ def ask(region, question, asked_by, image=None, sub_lob=None, clarify=True, _par
 # 6. LEARNING LOOP
 # ===========================================================================
 
-def give_feedback(qid, helpful: bool, comment="", trusted=False):
-    """👍 / 👎 from staff. This is where Vidya learns by itself."""
+def give_feedback(qid, helpful: bool, comment="", trusted=False, role=None, voter=None):
+    """👍 / 👎 from staff. role = "Agent" / "SME" / "Admin" (trusted=True means Admin, kept for old calls).
+    One 👎 sends the question to the SME Desk straight away (a person checks it). But votes only CHANGE
+    Vidya (search ranking, switching an answer off, proposing an answer to learn) once the voting rule
+    is met - the same rule for good and bad: see vote_verdict()."""
+    role = role or ("Admin" if trusted else "Agent")
     with _conn() as con:
         q = con.execute("SELECT * FROM questions WHERE id=?", (qid,)).fetchone()
         if not q:
-            return
-        con.execute("UPDATE questions SET feedback=?, comment=? WHERE id=?",
-                    (1 if helpful else -1, privacy.mask(comment), qid))
+            return None
+        voter = voter or q["asked_by"]
+        con.execute("UPDATE questions SET feedback=?, comment=?, feedback_role=? WHERE id=?",
+                    (1 if helpful else -1, privacy.mask(comment), role, qid))
         if not helpful:
             con.execute("UPDATE questions SET status='needs_review', gap_status=COALESCE(gap_status,'Open'), "
                         "sme_reason='Not helpful 👎' WHERE id=?", (qid,))
@@ -1904,44 +1943,96 @@ def give_feedback(qid, helpful: bool, comment="", trusted=False):
         question = re.sub(r"\s*\[screenshot\]$", "", q["question"])
         for s in sources[:2]:              # the passages that produced the answer
             if s.get("key"):
-                con.execute("INSERT INTO feedback_pairs (region, question, source_key, value, at) "
-                            "VALUES (?,?,?,?,?)", (q["region"], question, s["key"],
-                                                   1 if helpful else -1, _now()))
-        if not helpful:                    # a wrong auto-learned answer is switched off
-            for s in sources[:1]:
-                if s.get("key", "").startswith("l") and s.get("type") == "Auto-learned Q&A":
-                    con.execute("UPDATE learned SET active=0 WHERE id=? AND source='auto'",
-                                (int(s["key"][1:]),))
-    if helpful and config.AUTO_LEARN and q["result"] == "answered":
-        _auto_learn(q, question, trusted)
+                con.execute("INSERT INTO feedback_pairs (region, question, source_key, value, at, voter, role, qid) "
+                            "VALUES (?,?,?,?,?,?,?,?)", (q["region"], question, s["key"],
+                                                         1 if helpful else -1, _now(), voter, role, qid))
+    log(voter, "Feedback 👍" if helpful else "Feedback 👎", question, privacy.mask(comment or ""),
+        q["region"], role=role)
+    return _apply_votes(q, question, sources)
 
 
-def _auto_learn(q, question, trusted=False):
-    """Save an answer staff found helpful so similar questions get it straight away."""
-    if not sources_from_documents(q):
-        return                             # already a learned answer - nothing new to save
+# ---------------------------------------------------------------------------
+# VOTING RULE (same for good and bad)
+# ---------------------------------------------------------------------------
+def _is_sme_role(role):
+    return (role or "").lower() in ("sme", "admin")
+
+
+def vote_counts(rows):
+    """rows: feedback_pairs rows (voter, role, value, id). The LATEST vote of each person counts once."""
+    latest = {}
+    for r in sorted(rows, key=lambda r: r["id"]):
+        latest[r["voter"] or f"anon{r['id']}"] = r
+    c = {"agent_up": 0, "agent_down": 0, "sme_up": 0, "sme_down": 0}
+    for r in latest.values():
+        side = "up" if r["value"] > 0 else "down"
+        c[("sme_" if _is_sme_role(r["role"]) else "agent_") + side] += 1
+    return c
+
+
+def vote_verdict(c):
+    """'good' / 'bad' only when: at least FEEDBACK_MIN_VOTES different agents voted, at least
+    FEEDBACK_AGREE_PCT % of all votes are on one side, and at least FEEDBACK_MIN_SME_VOTES SMEs voted
+    on that side. Otherwise 'not enough votes' or 'mixed' - and nothing changes."""
+    agents = c["agent_up"] + c["agent_down"]
+    total = agents + c["sme_up"] + c["sme_down"]
+    if agents < config.FEEDBACK_MIN_VOTES:
+        return "not enough votes"
+    up, down = c["agent_up"] + c["sme_up"], c["agent_down"] + c["sme_down"]
+    if up * 100 >= config.FEEDBACK_AGREE_PCT * total and c["sme_up"] >= config.FEEDBACK_MIN_SME_VOTES:
+        return "good"
+    if down * 100 >= config.FEEDBACK_AGREE_PCT * total and c["sme_down"] >= config.FEEDBACK_MIN_SME_VOTES:
+        return "bad"
+    return "mixed"
+
+
+def vote_text(c):
+    return (f"agents 👍{c['agent_up']} 👎{c['agent_down']} · SMEs 👍{c['sme_up']} 👎{c['sme_down']}")
+
+
+def _similar_votes(region, question, source_key):
+    """Votes on this answer source for questions that mean the same."""
     with _conn() as con:
-        voters = con.execute("SELECT COUNT(DISTINCT asked_by) FROM questions WHERE region=? AND feedback=1 "
-                             "AND lower(question)=lower(?) AND lower(answer)=lower(?)",
-                             (q["region"], q["question"], q["answer"])).fetchone()[0]
-        if voters < config.AUTO_LEARN_MIN_VOTES and not trusted:
-            return
-        same = con.execute("SELECT id FROM learned WHERE region=? AND lower(question)=lower(?)",
-                           (q["region"], question)).fetchone()
-        if same:
-            con.execute("UPDATE learned SET votes=COALESCE(votes,0)+1, active=1 WHERE id=?", (same["id"],))
-            return
-    vec = None
-    if llm.embeddings_on():
-        try:
-            vec = _vec_to_blob(llm.embed([f"{question}\n{q['answer']}"])[0])
-        except llm.AIError:
-            pass
+        rows = [dict(r) for r in con.execute(
+            "SELECT id, question, voter, role, value FROM feedback_pairs WHERE region IN (?,?) AND source_key=?",
+            (region, config.GLOBAL_REGION, source_key))]
+    if not rows:
+        return []
+    texts = [r["question"] for r in rows]
+    vec = TfidfVectorizer(analyzer="char_wb", ngram_range=(3, 5)).fit(texts + [question])
+    sims = cosine_similarity(vec.transform([question]), vec.transform(texts)).ravel()
+    return [r for r, s in zip(rows, sims) if s >= config.FEEDBACK_SIMILARITY]
+
+
+def _apply_votes(q, question, sources):
+    """Act on votes only when the voting rule is met. Returns the verdict for the main source."""
+    if not sources or not sources[0].get("key"):
+        return None
+    top = sources[0]
+    c = vote_counts(_similar_votes(q["region"], question, top["key"]))
+    verdict = vote_verdict(c)
+    if top["key"].startswith("l") and verdict == "bad":          # a learned answer voted bad: switch it off
+        lid = int(top["key"][1:])
+        with _conn() as con:
+            con.execute("UPDATE learned SET active=0, decision_note=? WHERE id=? AND COALESCE(active,1)=1",
+                        (f"Switched off by votes ({vote_text(c)}) - admin can switch it on again", lid))
+        log("Vidya", "Learned answer switched off by votes", question, vote_text(c), q["region"], role="System")
+    elif (verdict == "good" and config.AUTO_LEARN and q["result"] == "answered"
+          and sources_from_documents(q)):
+        _propose_auto(q, question, c)
+    return verdict
+
+
+def _propose_auto(q, question, c):
+    """Enough good votes on a document answer: SEND IT TO THE ADMIN (it is not used until approved)."""
+    nq = _norm_q(question)
     with _conn() as con:
-        con.execute("INSERT INTO learned (region, question, answer, added_by, added_at, from_question,"
-                    " source, active, votes, embedding) VALUES (?,?,?,?,?,?,?,?,?,?)",
-                    (q["region"], question, q["answer"], "Vidya (staff 👍)", _now(), q["id"],
-                     "auto", 1, 1, vec))
+        for r in con.execute("SELECT question, status FROM learned WHERE region=? AND "
+                             "COALESCE(status,'approved') IN ('approved','pending')", (q["region"],)):
+            if _norm_q(r["question"]) == nq:
+                return
+    submit_for_approval(q["region"], question, q["answer"], "Vidya (staff votes)", "Staff votes",
+                        from_question=q["id"], vote_info=vote_text(c), source="auto")
 
 
 def sources_from_documents(q):
@@ -1959,26 +2050,145 @@ def review_queue(region=None):
         return [dict(r) for r in con.execute(q + " ORDER BY id DESC", args)]
 
 
-def teach(region, question, answer, admin, from_question=None, variants=None):
-    """Store a VERIFIED answer (written by the process team / an SME). Used first from now on.
-    variants = the wordings agents actually typed, so the same words find this answer again."""
-    question, answer = privacy.mask(question), privacy.mask(answer)
+def _variants_text(question, variants):
     variants = [privacy.mask(v) for v in (variants or [])]
-    vtext = " | ".join(dict.fromkeys(v.strip() for v in (variants or []) if v and v.strip()
-                                     and _norm_q(v) != _norm_q(question)))[:1000]
-    vec = None
+    return " | ".join(dict.fromkeys(v.strip() for v in variants if v and v.strip()
+                                    and _norm_q(v) != _norm_q(question)))[:1000]
+
+
+def _embed_learned(question, vtext, answer):
     if llm.embeddings_on():
         try:
-            vec = _vec_to_blob(llm.embed([f"{question}\n{vtext}\n{answer}"])[0])
+            return _vec_to_blob(llm.embed([f"{question}\n{vtext}\n{answer}"])[0])
         except llm.AIError:
             pass
+    return None
+
+
+def teach(region, question, answer, admin, from_question=None, variants=None):
+    """ADMIN ONLY: store a verified answer straight away (the admin is the approver, so it is
+    logged as submitted and approved by the admin). SMEs use submit_for_approval() instead."""
+    question, answer = privacy.mask(question), privacy.mask(answer)
+    vtext = _variants_text(question, variants)
+    vec = _embed_learned(question, vtext, answer)
+    now = _now()
     with _conn() as con:
-        con.execute("INSERT INTO learned (region, question, answer, added_by, added_at, from_question,"
-                    " source, active, votes, embedding, variants) VALUES (?,?,?,?,?,?,?,?,?,?,?)",
-                    (region, question, answer, admin, _now(), from_question, "verified", 1, 0, vec, vtext))
+        cur = con.execute(
+            "INSERT INTO learned (region, question, answer, added_by, added_at, from_question, source, active,"
+            " votes, embedding, variants, status, kind, submitted_by, submitted_at, decided_by, decided_at)"
+            " VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)",
+            (region, question, answer, admin, now, from_question, "verified", 1, 0, vec, vtext,
+             "approved", "Admin", admin, now, admin, now))
+        lid = cur.lastrowid
         if from_question:
             con.execute("UPDATE questions SET status='resolved', gap_status='Fixed' WHERE id=?",
                         (from_question,))
+    log(admin, "Answer added to Vidya by admin", question, f"learned #{lid}", region)
+    return lid
+
+
+# ===========================================================================
+# 6a. ADMIN APPROVAL - nothing enters Vidya's memory until an admin approves it
+#     (SME answers, live-chat answers, SME confirmations, SME edits, answers voted good by staff)
+# ===========================================================================
+
+def submit_for_approval(region, question, answer, by, kind, from_question=None, variants=None,
+                        replaces=None, vote_info="", source="verified", question_ids=None):
+    """Waits on Admin -> Approvals. NOT searched by Vidya until approved."""
+    question, answer = privacy.mask((question or "").strip()), privacy.mask((answer or "").strip())
+    if not question or not answer:
+        raise ValueError("Please write the question and the answer.")
+    vtext = _variants_text(question, variants)
+    with _conn() as con:
+        cur = con.execute(
+            "INSERT INTO learned (region, question, answer, added_by, added_at, from_question, source, active,"
+            " votes, variants, status, kind, submitted_by, submitted_at, replaces, vote_info, question_ids)"
+            " VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)",
+            (region, question, answer, by, _now(), from_question, source, 0, 0, vtext, "pending", kind,
+             by, _now(), replaces, vote_info or "",
+             ",".join(str(i) for i in (question_ids or ([from_question] if from_question else [])))))
+        lid = cur.lastrowid
+    log(by, "Sent to admin for approval", question, f"{kind} · #{lid}" + (f" · {vote_info}" if vote_info else ""),
+        region)
+    return lid
+
+
+def _qids(r):
+    raw = (r["question_ids"] if "question_ids" in r.keys() else "") or ""
+    ids = [int(x) for x in raw.split(",") if x.strip().isdigit()]
+    return ids or ([r["from_question"]] if r["from_question"] else [])
+
+
+def pending_approvals(region=None):
+    q, args = "SELECT * FROM learned WHERE status='pending'", []
+    if region:
+        q += " AND region=?"; args.append(region)
+    with _conn() as con:
+        return [dict(r) for r in con.execute(q + " ORDER BY id", args)]
+
+
+def approve(lid, admin, question=None, answer=None, note=""):
+    """Admin approves (optionally with edits). From now on Vidya uses it."""
+    with _conn() as con:
+        r = con.execute("SELECT * FROM learned WHERE id=?", (lid,)).fetchone()
+    if not r or r["status"] != "pending":
+        raise ValueError("This answer is no longer waiting for approval.")
+    q = privacy.mask((question if question is not None else r["question"]).strip())
+    a = privacy.mask((answer if answer is not None else r["answer"]).strip())
+    if not q or not a:
+        raise ValueError("Question and answer can't be empty.")
+    edited = (q, a) != (r["question"], r["answer"])
+    vec = _embed_learned(q, r["variants"] or "", a)
+    now = _now()
+    with _conn() as con:
+        con.execute("UPDATE learned SET question=?, answer=?, embedding=?, status='approved', active=1, "
+                    "decided_by=?, decided_at=?, decision_note=? WHERE id=?",
+                    (q, a, vec, admin, now, privacy.mask(note or ("Approved with edits" if edited else "")), lid))
+        if r["replaces"]:
+            con.execute("UPDATE learned SET active=0, status='replaced', decision_note=? WHERE id=?",
+                        (f"Replaced by #{lid}", r["replaces"]))
+        ids = _qids(r)
+        if ids:
+            con.execute(f"UPDATE questions SET status='resolved', gap_status=CASE WHEN gap_status IS NULL THEN NULL "
+                        f"ELSE 'Fixed' END WHERE id IN ({','.join('?' * len(ids))})", ids)
+    log(admin, "Approved with edits" if edited else "Approved", q,
+        f"#{lid} · {r['kind']} · submitted by {r['submitted_by']}", r["region"])
+    return lid
+
+
+def reject(lid, admin, note=""):
+    """Admin rejects: it never enters Vidya's memory. The agent keeps the SME's reply."""
+    with _conn() as con:
+        r = con.execute("SELECT * FROM learned WHERE id=?", (lid,)).fetchone()
+        if not r or r["status"] != "pending":
+            raise ValueError("This answer is no longer waiting for approval.")
+        con.execute("UPDATE learned SET status='rejected', active=0, decided_by=?, decided_at=?, decision_note=? "
+                    "WHERE id=?", (admin, _now(), privacy.mask(note or ""), lid))
+        ids = _qids(r)
+        if ids:
+            con.execute(f"UPDATE questions SET gap_status=CASE WHEN gap_status IS NULL THEN NULL ELSE 'Open' END, "
+                        f"gap_note=? WHERE id IN ({','.join('?' * len(ids))})",
+                        [f"Answer rejected by admin {admin}" + (f": {note}" if note else ""), *ids])
+    log(admin, "Rejected", r["question"], f"#{lid} · {r['kind']} · submitted by {r['submitted_by']}"
+        + (f" · {note}" if note else ""), r["region"])
+
+
+def approval_log(region=None, days=None):
+    """Every answer sent for approval: who submitted, when, who decided, decision."""
+    q, args = "SELECT * FROM learned WHERE COALESCE(kind,'')<>''", []
+    if region:
+        q += " AND region=?"; args.append(region)
+    if days:
+        q += " AND COALESCE(submitted_at, added_at)>=?"
+        args.append((datetime.now() - timedelta(days=days)).strftime("%Y-%m-%d %H:%M"))
+    with _conn() as con:
+        rows = [dict(r) for r in con.execute(q + " ORDER BY id DESC", args)]
+    return [{"#": r["id"], "Region": r["region"], "Type": r["kind"], "Question": r["question"],
+             "Answer": r["answer"], "Submitted by": r["submitted_by"] or r["added_by"],
+             "Submitted at": r["submitted_at"] or r["added_at"], "Status": (r["status"] or "approved").title(),
+             "Decided by": r["decided_by"] or "", "Decided at": r["decided_at"] or "",
+             "Note": r["decision_note"] or "", "Votes": r["vote_info"] or "",
+             "In use": "Yes" if r["active"] and r["status"] == "approved" else "No"} for r in rows]
 
 
 # ===========================================================================
@@ -2022,9 +2232,28 @@ def sme_queue(region=None):
     return sorted(groups.values(), key=lambda g: (g["count"], g["last"]), reverse=True)
 
 
-def sme_answer(ids, region, question, answer, sme):
-    """Save the SME's answer as a verified answer (searched first next time) and close the questions.
-    Uploaded SOPs / documents are NOT changed."""
+def sme_reply(ids, text, sme):
+    """The SME's reply goes to the agent(s) who asked (My Questions + a note on Ask Vidya).
+    It does NOT change Vidya's memory."""
+    text = privacy.mask((text or "").strip())
+    if not ids or not text:
+        return
+    marks = ",".join("?" * len(ids))
+    with _conn() as con:
+        rows = con.execute(f"SELECT region, asked_by, question FROM questions WHERE id IN ({marks})", ids).fetchall()
+        con.execute(f"UPDATE questions SET sme_reply=?, sme_reply_by=?, sme_reply_at=?, sme_reply_seen=0 "
+                    f"WHERE id IN ({marks})", [text, sme, _now(), *ids])
+    if rows:
+        log(sme, "SME replied to agent", re.sub(r"\s*\[screenshot\]$", "", rows[0]["question"]),
+            "to " + ", ".join(sorted({r["asked_by"] for r in rows})), rows[0]["region"])
+
+
+def sme_answer(ids, region, question, answer, sme, to_vidya=True):
+    """SME answers a waiting question.
+    1. The agent(s) who asked get the answer at once (My Questions).
+    2. to_vidya=True: it is SENT TO THE ADMIN for approval. Vidya uses it only after approval.
+       to_vidya=False: reply to the agent only - Vidya's memory is not changed.
+    Uploaded SOPs / documents are never changed."""
     question, answer = (question or "").strip(), (answer or "").strip()
     if not question or not answer:
         raise ValueError("Please write the question and the answer.")
@@ -2033,8 +2262,13 @@ def sme_answer(ids, region, question, answer, sme):
         with _conn() as con:
             asked = [re.sub(r"\s*\[screenshot\]$", "", r[0]) for r in con.execute(
                 f"SELECT question FROM questions WHERE id IN ({','.join('?' * len(ids))})", ids)]
-    teach(region, question, answer, sme, from_question=ids[0] if ids else None, variants=asked)
-    _close(ids, sme, "resolved", "Fixed")
+    sme_reply(ids, answer, sme)
+    lid = None
+    if to_vidya:
+        lid = submit_for_approval(region, question, answer, sme, "SME answer", from_question=ids[0] if ids else None,
+                                  variants=asked, question_ids=ids)
+    _close(ids, sme, "sme_answered", "In progress" if to_vidya else "Fixed")
+    return lid
 
 
 def _close(ids, sme, status, gap):
@@ -2047,42 +2281,91 @@ def _close(ids, sme, status, gap):
 
 
 def sme_confirm(ids, sme):
-    """The SME checked Vidya's answer and it is right: keep it as a verified answer."""
+    """The SME checked Vidya's answer and it is right: the agent is told, the SME's 👍 counts as an SME
+    vote, and the answer is sent to the admin to be kept as a verified answer."""
     with _conn() as con:
         q = con.execute("SELECT * FROM questions WHERE id=?", (ids[0],)).fetchone()
     if not q or q["result"] != "answered":
         raise ValueError("There is no Vidya answer to confirm - please write the answer.")
-    sme_answer(ids, q["region"], re.sub(r"\s*\[screenshot\]$", "", q["question"]), q["answer"], sme)
+    question = re.sub(r"\s*\[screenshot\]$", "", q["question"])
+    with _conn() as con:
+        for s in json.loads(q["sources"] or "[]")[:2]:
+            if s.get("key"):
+                con.execute("INSERT INTO feedback_pairs (region, question, source_key, value, at, voter, role, qid) "
+                            "VALUES (?,?,?,?,?,?,?,?)", (q["region"], question, s["key"], 1, _now(), sme, "SME",
+                                                         q["id"]))
+    sme_reply(ids, f"✅ Checked by SME {sme}: Vidya's answer is correct.\n\n{q['answer']}", sme)
+    lid = submit_for_approval(q["region"], question, q["answer"], sme, "SME confirmed Vidya's answer",
+                              from_question=ids[0], variants=[question], question_ids=ids)
+    _close(ids, sme, "sme_answered", "In progress")
+    return lid
 
 
 def sme_flag_sop(ids, sme, note=""):
     """Needs a change in the SOP itself: goes to Admin → Knowledge Gaps."""
     set_gap(ids, status="SOP update needed", owner="", note=note or f"Flagged by SME {sme}")
     _close(ids, sme, "sop_update", "SOP update needed")
+    log(sme, "Flagged: SOP update needed", _first_question(ids), note)
 
 
 def sme_dismiss(ids, sme):
     _close(ids, sme, "dismissed", "Closed")
+    log(sme, "Dismissed (not a process question)", _first_question(ids))
 
 
-def update_learned(lid, question, answer, editor):
+def _first_question(ids):
+    if not ids:
+        return ""
+    with _conn() as con:
+        r = con.execute("SELECT question FROM questions WHERE id=?", (ids[0],)).fetchone()
+    return r[0] if r else ""
+
+
+def update_learned(lid, question, answer, editor, is_admin=True):
+    """Admin: changes the answer in Vidya at once (logged). SME (is_admin=False): the change is SENT
+    TO THE ADMIN; the old answer stays in use until the admin approves the new one."""
     question, answer = privacy.mask((question or "").strip()), privacy.mask((answer or "").strip())
     if not question or not answer:
         raise ValueError("Question and answer can't be empty.")
-    vec = None
-    if llm.embeddings_on():
-        try:
-            vec = _vec_to_blob(llm.embed([f"{question}\n{answer}"])[0])
-        except llm.AIError:
-            pass
+    with _conn() as con:
+        old = con.execute("SELECT * FROM learned WHERE id=?", (lid,)).fetchone()
+    if not old:
+        raise ValueError("This answer no longer exists.")
+    if not is_admin:
+        return submit_for_approval(old["region"], question, answer, editor, f"Edit of answer #{lid}",
+                                   replaces=lid, variants=(old["variants"] or "").split(" | "))
+    vec = _embed_learned(question, old["variants"] or "", answer)
     with _conn() as con:   # the agents' wordings (variants) are kept
         con.execute("UPDATE learned SET question=?, answer=?, added_by=?, added_at=?, embedding=? WHERE id=?",
                     (question, answer, editor, _now(), vec, lid))
+    log(editor, "Edited answer in Vidya", question, f"#{lid}", old["region"])
+    return lid
 
 
 def sme_answers(region=None):
-    """Verified answers (written by SMEs / process team), newest first."""
+    """Verified answers in use or switched off (approved by an admin), newest first."""
     return list_learned(region, "verified")
+
+
+def my_submissions(user, limit=100):
+    """What this SME sent for approval and what the admin decided."""
+    with _conn() as con:
+        return [dict(r) for r in con.execute(
+            "SELECT * FROM learned WHERE submitted_by=? AND COALESCE(kind,'')<>'Admin' ORDER BY id DESC "
+            f"LIMIT {int(limit)}", (user,))]
+
+
+def sme_replies_for(user, unseen_only=False):
+    q = "SELECT * FROM questions WHERE asked_by=? AND sme_reply IS NOT NULL"
+    if unseen_only:
+        q += " AND COALESCE(sme_reply_seen,0)=0"
+    with _conn() as con:
+        return [dict(r) for r in con.execute(q + " ORDER BY sme_reply_at DESC", (user,))]
+
+
+def mark_replies_seen(user):
+    with _conn() as con:
+        con.execute("UPDATE questions SET sme_reply_seen=1 WHERE asked_by=? AND sme_reply IS NOT NULL", (user,))
 
 
 # ===========================================================================
@@ -2131,6 +2414,7 @@ def start_chat(region, agent, text, sub_lob="", from_question=None, image=None):
         cur = con.execute("INSERT INTO sme_chats (region, sub_lob, agent, status, started_at, from_question) "
                           "VALUES (?,?,?,?,?,?)", (region, sub_lob or "", agent, "waiting", _now(), from_question))
         cid = cur.lastrowid
+    log(agent, "Live chat started", text[:200], f"chat #{cid}", region)
     path = _chat_image(cid, image) if image else None
     with _conn() as con:
         _msg(con, cid, agent, "agent", text, path)
@@ -2194,7 +2478,10 @@ def pick_up_chat(chat_id, sme):
                           (sme, _now(), chat_id))
         if cur.rowcount:
             _msg(con, chat_id, "Vidya", "system", f"{sme} (SME) joined the chat.")
-        return bool(cur.rowcount)
+        ok = bool(cur.rowcount)
+    if ok:
+        log(sme, "Live chat picked up", f"chat #{chat_id}")
+    return ok
 
 
 def close_chat(chat_id, by):
@@ -2217,6 +2504,7 @@ def close_chat(chat_id, by):
                                 " VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)",
                                 (c["region"], c["agent"], first[0], "", "[]", 0.0, "needs_review", _now(), "{}",
                                  "", "not_found", "Open", c["region"], c["sub_lob"], "Live chat - no SME reply"))
+    log(by, "Live chat ended", f"chat #{chat_id}", "no SME reply" if not replied else "", c["region"])
 
 
 _CHATTER = re.compile(r"^(hi|hello|hey|ok|okay|thanks|thank you|thx|ty|yes|no|sure|wait|one (min|moment)|"
@@ -2252,12 +2540,15 @@ def save_chat_pairs(chat_id, pairs, sme):
     for p in pairs:
         q, a = (p.get("question") or "").strip(), (p.get("answer") or "").strip()
         if q and a:
-            teach(c["region"], q, a, sme, from_question=c.get("from_question"), variants=p.get("asked") or [])
+            submit_for_approval(c["region"], q, a, sme, f"Live chat #{chat_id}", from_question=c.get("from_question"),
+                                variants=p.get("asked") or [])
             n += 1
     with _conn() as con:
         con.execute("UPDATE sme_chats SET saved=1, saved_count=saved_count+? WHERE id=?", (n, chat_id))
     if n and c.get("from_question"):
-        _close([c["from_question"]], sme, "resolved", "Fixed")
+        _close([c["from_question"]], sme, "sme_answered", "In progress")
+    if not n:
+        log(sme, "Live chat closed - nothing sent to Vidya", f"chat #{chat_id}", "", c["region"])
     return n
 
 
@@ -2350,13 +2641,16 @@ def mask_existing_data(images=True):
     return fixed
 
 
-def dismiss(qid):
+def dismiss(qid, by=""):
     with _conn() as con:
         con.execute("UPDATE questions SET status='dismissed', gap_status='Closed' WHERE id=?", (qid,))
+    if by:
+        log(by, "Question dismissed", _first_question([qid]))
 
 
 def list_learned(region=None, source=None):
-    q, args, where = "SELECT * FROM learned", [], []
+    """Approved answers (in use or switched off). Pending / rejected ones are on Admin -> Approvals."""
+    q, args, where = "SELECT * FROM learned", [], ["COALESCE(status,'approved')='approved'"]
     if region:
         where.append("region=?"); args.append(region)
     if source:
@@ -2369,12 +2663,17 @@ def list_learned(region=None, source=None):
 
 def set_learned(lid, active=None, delete=False, make_verified=False, admin=""):
     with _conn() as con:
+        r = con.execute("SELECT question, region FROM learned WHERE id=?", (lid,)).fetchone()
         if delete:
             con.execute("DELETE FROM learned WHERE id=?", (lid,))
         if active is not None:
             con.execute("UPDATE learned SET active=? WHERE id=?", (1 if active else 0, lid))
         if make_verified:
             con.execute("UPDATE learned SET source='verified', added_by=? WHERE id=?", (admin, lid))
+    if r:
+        what = ("Deleted answer from Vidya" if delete else "Made auto-learned answer verified" if make_verified
+                else "Switched answer on" if active else "Switched answer off")
+        log(admin, what, r["question"], f"#{lid}", r["region"])
 
 
 # ===========================================================================
@@ -2432,7 +2731,7 @@ def knowledge_gaps(region=None, since=None, include_closed=False):
     return groups
 
 
-def set_gap(ids, status=None, owner=None, note=None):
+def set_gap(ids, status=None, owner=None, note=None, by=""):
     with _conn() as con:
         for i in ids:
             if status is not None:
@@ -2443,6 +2742,9 @@ def set_gap(ids, status=None, owner=None, note=None):
                 con.execute("UPDATE questions SET gap_owner=? WHERE id=?", (owner, i))
             if note is not None:
                 con.execute("UPDATE questions SET gap_note=? WHERE id=?", (note, i))
+    if by and ids:
+        log(by, "Knowledge gap updated", _first_question(ids),
+            " · ".join(x for x in (status and f"status {status}", owner and f"owner {owner}", note) if x))
 
 
 def recheck_gaps(region, doc_title=""):
@@ -2586,7 +2888,9 @@ def add_announcement(title, body, level, region, author, ticker=True, until=None
         cur = con.execute("INSERT INTO announcements (title, body, level, region, author, created_at, active, ticker,"
                           " until) VALUES (?,?,?,?,?,?,1,?,?)",
                           (title, body, level, region, author, _now(), 1 if ticker else 0, until or None))
-        return cur.lastrowid
+        aid = cur.lastrowid
+    log(author, "Announcement posted", title, f"{level} · running line {'on' if ticker else 'off'}", region)
+    return aid
 
 
 def announcements(region=None, active_only=True, ticker_only=False):
@@ -2605,9 +2909,12 @@ def announcements(region=None, active_only=True, ticker_only=False):
         return [dict(r) for r in con.execute(q + " ORDER BY id DESC", args)]
 
 
-def set_announcement(aid, active):
+def set_announcement(aid, active, by=""):
     with _conn() as con:
         con.execute("UPDATE announcements SET active=? WHERE id=?", (1 if active else 0, aid))
+        r = con.execute("SELECT title, region FROM announcements WHERE id=?", (aid,)).fetchone()
+    if r:
+        log(by, "Announcement shown" if active else "Announcement hidden", r["title"], "", r["region"])
 
 
 # ===========================================================================
@@ -2640,7 +2947,7 @@ def make_backup():
     return buf.getvalue()
 
 
-def restore_backup(data: bytes):
+def restore_backup(data: bytes, by=""):
     """Replace the knowledge base with a backup made by make_backup(). Returns document count."""
     import zipfile
     from pathlib import PurePosixPath
@@ -2682,4 +2989,162 @@ def restore_backup(data: bytes):
         tmp.unlink(missing_ok=True)
     init_db()                                 # older backups get the new columns
     mask_existing_data(images=False)          # an older backup may hold numbers the current rule hides
+    if by:
+        log(by, "Backup restored", f"{docs} documents")
     return docs
+
+
+# ===========================================================================
+# 10. ACTIVITY LOG & REPORTS - who did what, when (admins and SMEs can see and export it)
+# ===========================================================================
+ROLES = ("Agent", "SME", "Admin")
+
+
+def log(user, action, item="", detail="", region="", role=None):
+    """One line in the activity log. role=None: the role the person last signed in with."""
+    try:
+        with _conn() as con:
+            if role is None:
+                r = con.execute("SELECT role FROM audit_log WHERE user=? AND action='Signed in' ORDER BY id DESC "
+                                "LIMIT 1", (user or "",)).fetchone()
+                role = r[0] if r else ""
+            con.execute("INSERT INTO audit_log (at, user, role, action, region, item, detail) VALUES (?,?,?,?,?,?,?)",
+                        (_now(), user or "", role or "", action, region or "",
+                         privacy.mask(str(item or ""))[:300], privacy.mask(str(detail or ""))[:1000]))
+    except sqlite3.Error:
+        pass                                   # the log must never stop the real work
+
+
+def _since(days):
+    return (datetime.now() - timedelta(days=days)).strftime("%Y-%m-%d %H:%M") if days else None
+
+
+def activity_df(days=None, region=None, include_questions=True):
+    """Every action (sign-in, upload, delete, SME reply, sent for approval, approved, rejected, feedback,
+    announcements, chats, settings) plus every question asked - newest first."""
+    import pandas as pd
+    since = _since(days)
+    q, args = "SELECT at, user, role, action, region, item, detail FROM audit_log WHERE 1=1", []
+    if since:
+        q += " AND at>=?"; args.append(since)
+    if region and region != "All":
+        q += " AND (region=? OR region='')"; args.append(region)
+    with _conn() as con:
+        df = pd.read_sql_query(q, con, params=args)
+        if include_questions:
+            q2, a2 = ("SELECT asked_at AS at, asked_by AS user, '' AS role, 'Question asked' AS action, region, "
+                      "question AS item, COALESCE(result,'') || CASE WHEN confidence_pct IS NOT NULL "
+                      "THEN ' · ' || confidence_pct || '%' ELSE '' END AS detail FROM questions WHERE 1=1", [])
+            if since:
+                q2 += " AND asked_at>=?"; a2.append(since)
+            if region and region != "All":
+                q2 += " AND region=?"; a2.append(region)
+            df = pd.concat([df, pd.read_sql_query(q2, con, params=a2)], ignore_index=True)
+    if df.empty:
+        return pd.DataFrame(columns=["When", "User", "Role", "Action", "LOB", "Item", "Detail"])
+    df = df.sort_values("at", ascending=False)
+    return df.rename(columns={"at": "When", "user": "User", "role": "Role", "action": "Action", "region": "LOB",
+                              "item": "Item", "detail": "Detail"})
+
+
+def documents_report():
+    """Who uploaded which document, when, its version and status (deleted ones are in the activity log)."""
+    import pandas as pd
+    with _conn() as con:
+        df = pd.read_sql_query("SELECT id, region, sub_lob, doc_type, title, filename, version, owner, uploaded_by, "
+                               "uploaded_at, effective_date, status, chunks FROM documents ORDER BY id DESC", con)
+    return df.rename(columns={"id": "#", "region": "LOB", "sub_lob": "Sub-LOB", "doc_type": "Type", "title": "Title",
+                              "filename": "File", "version": "Version", "owner": "Owner",
+                              "uploaded_by": "Uploaded by", "uploaded_at": "Uploaded at",
+                              "effective_date": "Effective date", "status": "Status", "chunks": "Pieces"})
+
+
+def _source_titles(keys):
+    out = {}
+    cids = [int(k[1:]) for k in keys if k.startswith("c") and k[1:].isdigit()]
+    lids = [int(k[1:]) for k in keys if k.startswith("l") and k[1:].isdigit()]
+    with _conn() as con:
+        if cids:
+            for r in con.execute(f"SELECT c.id, d.title, c.location FROM chunks c JOIN documents d ON d.id=c.doc_id "
+                                 f"WHERE c.id IN ({','.join('?' * len(cids))})", cids):
+                out[f"c{r[0]}"] = f"📄 {r[1]} · {r[2]}"
+        if lids:
+            for r in con.execute(f"SELECT id, question, active FROM learned WHERE id IN ({','.join('?' * len(lids))})",
+                                 lids):
+                out[f"l{r[0]}"] = f"🧑‍🏫 Q&A: {r[1]}" + ("" if r[2] else " (switched off)")
+    return out
+
+
+def votes_report(region=None):
+    """Votes per answer source with the voting-rule result (same rule for good and bad)."""
+    import pandas as pd
+    q, args = "SELECT id, region, source_key, value, voter, role FROM feedback_pairs", []
+    if region and region != "All":
+        q += " WHERE region=?"; args.append(region)
+    with _conn() as con:
+        rows = [dict(r) for r in con.execute(q, args)]
+    groups = {}
+    for r in rows:
+        groups.setdefault((r["region"], r["source_key"]), []).append(r)
+    titles = _source_titles({k for _, k in groups})
+    out = []
+    for (reg, key), rs in groups.items():
+        c = vote_counts(rs)
+        out.append({"LOB": reg, "Answer source": titles.get(key, key), "Agents 👍": c["agent_up"],
+                    "Agents 👎": c["agent_down"], "SMEs 👍": c["sme_up"], "SMEs 👎": c["sme_down"],
+                    "Result": vote_verdict(c).title()})
+    df = pd.DataFrame(out, columns=["LOB", "Answer source", "Agents 👍", "Agents 👎", "SMEs 👍", "SMEs 👎", "Result"])
+    return df.sort_values(["Agents 👍", "Agents 👎"], ascending=False) if not df.empty else df
+
+
+def sme_activity(days=None):
+    """Per SME / admin: replies to agents, sent for approval, approved, rejected, chats, announcements."""
+    import pandas as pd
+    df = activity_df(days, include_questions=False)
+    if df.empty:
+        return pd.DataFrame(columns=["User"])
+    df = df[df["Role"].isin(["SME", "Admin"])]
+    measures = {"SME replied to agent": "Replies to agents", "Sent to admin for approval": "Sent for approval",
+                "Approved": "Approved", "Approved with edits": "Approved with edits", "Rejected": "Rejected",
+                "Live chat picked up": "Live chats", "Announcement posted": "Announcements",
+                "Document uploaded": "Documents uploaded", "Feedback 👍": "👍 given", "Feedback 👎": "👎 given"}
+    df = df[df["Action"].isin(measures)].assign(Measure=lambda d: d["Action"].map(measures))
+    if df.empty:
+        return pd.DataFrame(columns=["User"])
+    t = df.pivot_table(index=["User", "Role"], columns="Measure", values="Action", aggfunc="count", fill_value=0)
+    return t.reset_index()
+
+
+def reports_excel(days=None, region=None):
+    """One workbook: Activity log, Questions asked, Documents, Approvals, Votes, SME activity."""
+    import pandas as pd
+    from openpyxl.styles import Alignment, Font, PatternFill
+    qdf = questions_df(region, days)
+    qcols = {"asked_at": "Asked at", "region": "LOB", "sub_lob": "Sub-LOB", "asked_by": "Asked by",
+             "topic": "Topic", "question": "Question", "result": "Result", "confidence_pct": "Confidence %",
+             "helpful": "Helpful?", "comment": "Staff comment", "sme_reply_by": "SME who replied",
+             "sme_reply_at": "SME replied at", "status": "Workflow status"}
+    qdf = (qdf[[c for c in qcols if c in qdf]].rename(columns=qcols) if not qdf.empty
+           else pd.DataFrame(columns=list(qcols.values())))
+    sheets = {"Activity log": activity_df(days, region), "Questions asked": qdf,
+              "Documents": documents_report(),
+              "Approvals": pd.DataFrame(approval_log(None if region in (None, "All") else region, days)),
+              "Votes": votes_report(region), "SME activity": sme_activity(days)}
+    buf = io.BytesIO()
+    with pd.ExcelWriter(buf, engine="openpyxl") as xw:
+        for name, df in sheets.items():
+            (df if not df.empty else pd.DataFrame({"": ["No data in this period"]})).to_excel(
+                xw, sheet_name=name, index=False)
+        for ws in xw.book.worksheets:
+            for c in ws[1]:
+                c.font = Font(bold=True, color="FFFFFF")
+                c.fill = PatternFill("solid", fgColor="1F5FBF")
+            ws.freeze_panes = "A2"
+            if ws.max_row > 1:
+                ws.auto_filter.ref = ws.dimensions
+            for col in ws.columns:
+                longest = max(len(str(c.value or "")) for c in col)
+                ws.column_dimensions[col[0].column_letter].width = min(60, max(10, longest + 2))
+                for c in col[1:]:
+                    c.alignment = Alignment(wrap_text=longest > 60, vertical="top")
+    return buf.getvalue()

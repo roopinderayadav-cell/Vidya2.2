@@ -88,6 +88,8 @@ if not ss.user:
                 else:
                     ss.user, ss.region = name.strip(), region
                     ss.is_admin, ss.is_sme = role.startswith("Admin"), role.startswith(("SME", "Admin"))
+                    kb.log(ss.user, "Signed in", "", "", region,
+                           role="Admin" if ss.is_admin else "SME" if ss.is_sme else "Agent")
                     st.rerun()
     with right:
         ui.card("How Vidya works", "<ol style='margin:0;padding-left:18px;line-height:1.9'>"
@@ -104,6 +106,7 @@ if not ss.user:
 # TOP BAR: who is signed in, region, sign out  (never hidden - no sidebar needed)
 # ---------------------------------------------------------------------------
 LOBS = kb.get_lobs()
+ROLE = "Admin" if ss.is_admin else "SME" if ss.is_sme else "Agent"
 
 bar, ctl = st.columns([5.2, 1.3], vertical_alignment="center")
 with bar:
@@ -271,7 +274,7 @@ def render_answer(msg, i):
         elif msg.get("rated") != "pending":
             b1, b2, _ = st.columns([1.6, 2, 4])
             if b1.button("👍 Helpful", key=f"up{region}{i}"):
-                kb.give_feedback(msg["qid"], True, trusted=ss.is_admin)
+                kb.give_feedback(msg["qid"], True, role=ROLE, voter=ss.user)
                 msg["rated"] = True
                 st.rerun()
             if b2.button("👎 Not helpful", key=f"dn{region}{i}"):
@@ -281,7 +284,7 @@ def render_answer(msg, i):
             with st.form(f"fb{region}{i}"):
                 note = st.text_area("What was wrong or missing? (optional)")
                 if st.form_submit_button("Send to process team"):
-                    kb.give_feedback(msg["qid"], False, note)
+                    kb.give_feedback(msg["qid"], False, note, role=ROLE, voter=ss.user)
                     msg["rated"] = True
                     st.rerun()
 
@@ -323,6 +326,12 @@ def page_ask():
     sub_lob = lob_bar()
     if ss.is_sme or ss.is_admin:
         sme_notice()
+    new_replies = kb.sme_replies_for(ss.user, unseen_only=True)
+    if new_replies:
+        r1, r2 = st.columns([5, 1.2], vertical_alignment="center")
+        r1.info(f"🧑‍🏫 An SME answered {len(new_replies)} of your question(s).")
+        if r2.button("Read now", key="read_replies", width="stretch"):
+            st.switch_page(MYQ_PAGE)
     if ss.pending_clarify:
         pc, ss.pending_clarify = ss.pending_clarify, None
         ask_now(pc["q"], sub_lob=pc.get("sub_lob"), clarify=False)
@@ -526,6 +535,14 @@ def page_sme_chat():
 def page_my_questions():
     lob_bar(chips=False)
     st.header("My Questions")
+    new_replies = kb.sme_replies_for(ss.user, unseen_only=True)
+    if new_replies:
+        st.markdown("<div class='om-section'>🧑‍🏫 New answers from SMEs</div>", unsafe_allow_html=True)
+        for r in new_replies:
+            with st.container(border=True):
+                st.markdown(f"{ui.region_pill(r['region'])} &nbsp; **{ui.esc(r['question'])}**", unsafe_allow_html=True)
+                st.markdown(r["sme_reply"])
+                st.caption(f"SME {r['sme_reply_by']} · {r['sme_reply_at']}")
     rows = kb.history(region, ss.user, 100)
     if not rows:
         st.info("You haven't asked anything in this region yet.")
@@ -535,8 +552,13 @@ def page_my_questions():
         with st.expander(f"{label} {r['asked_at']} · {r['question']}"):
             st.markdown(ui.result_badge(result), unsafe_allow_html=True)
             st.markdown(r["answer"] or "")
+            if r.get("sme_reply"):
+                st.markdown(f"<div class='om-important'>🧑‍🏫 <b>Answer from SME {ui.esc(r['sme_reply_by'] or '')}</b>"
+                            f" · {ui.esc(r['sme_reply_at'] or '')}</div>", unsafe_allow_html=True)
+                st.markdown(r["sme_reply"])
             if r["status"] == "resolved":
-                st.success("The process team has added an answer - ask again to see it.")
+                st.success("The process team has added an answer to Vidya - ask again to see it.")
+    kb.mark_replies_seen(ss.user)
 
 
 # ---------------------------------------------------------------------------
@@ -600,7 +622,7 @@ def page_announcements():
                 st.write(a["body"])
             st.caption(f"{a['author']} · {a['created_at']}")
             if (ss.is_admin or (ss.is_sme and a["author"] == ss.user)) and st.button("Hide", key=f"hide{a['id']}"):
-                kb.set_announcement(a["id"], False)
+                kb.set_announcement(a["id"], False, by=ss.user)
                 st.rerun()
 
 
@@ -624,16 +646,20 @@ staff = [_page(page_ask, "Ask Vidya", "💬", "ask", True),
          _page(page_library, "Knowledge Library", "📚", "library"),
          _page(page_quick_guides, "Quick Guides", "⚡", "quick-guides"),
          _page(page_announcements, "Announcements", "📢", "announcements")]
-CHAT_PAGE = staff[1]
+CHAT_PAGE, MYQ_PAGE = staff[1], staff[2]
 sections = {"Vidya": staff}
 if ss.is_sme or ss.is_admin:
     n_sme = len(kb.sme_queue()) + len(kb.waiting_chats())
     SME_PAGE = _page(_admin(admin_pages.sme_desk), f"SME Desk ({n_sme})", "🧑‍🏫", "sme-desk")
-    sections["SME"] = [SME_PAGE]
+    # Dashboard and Reports & Logs: SMEs and admins
+    sections["SME"] = [SME_PAGE,
+                       _page(_admin(admin_pages.dashboard), "Dashboard", "📊", "dashboard"),
+                       _page(_admin(admin_pages.reports), "Reports & Logs", "📑", "reports")]
 if ss.is_admin:
     n_review, n_gaps = len(kb.review_queue()), len(kb.knowledge_gaps())
+    n_appr = len(kb.pending_approvals())
     sections["Admin"] = [
-        _page(_admin(admin_pages.dashboard), "Dashboard", "📊", "dashboard"),
+        _page(_admin(admin_pages.approvals), f"Approvals ({n_appr})", "🛡️", "approvals"),
         _page(_admin(admin_pages.documents), "Document Management", "🗂️", "documents"),
         _page(_admin(admin_pages.review), f"Review Queue ({n_review})", "🧠", "review"),
         _page(_admin(admin_pages.gaps), f"Knowledge Gaps ({n_gaps})", "🕳️", "gaps"),

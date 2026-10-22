@@ -21,7 +21,7 @@ CHECKS = [
     ("Verify Penalties", "Confirm change fees, cancellation charges, fare differences and applicable taxes."),
     ("Check Ticket Status", "Validate ticket coupons, Ticket/MCO validity, no-show conditions and eligibility "
                             "before processing."),
-    ("Check PNR history", "PNR history to validate ticket cancellation time - for now show, cancellation by "
+    ("Check PNR history", "PNR history to validate ticket cancellation time - for no show, cancellation by"
                           "airline or voluntary."),
 ]
 

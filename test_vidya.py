@@ -363,14 +363,24 @@ def test_sme_answer_is_used_next_time_and_documents_unchanged():
         assert kb.ask("NORAM", "obt login issue", who)["result"] == "not_found"
     g = [g for g in kb.sme_queue("NORAM") if g["question"] == "obt login issue"][0]
     assert g["count"] == 2 and g["reasons"] == ["No answer"] and set(g["users"]) == {"a1", "a2"}
-    kb.sme_answer(g["ids"], "NORAM", "Traveller cannot log in to the OBT",
-                  "1. Ask the traveller to reset the password.\n2. Still locked: raise a ticket to OBT support.", "Priya")
+    lid = kb.sme_answer(g["ids"], "NORAM", "Traveller cannot log in to the OBT",
+                        "1. Ask the traveller to reset the password.\n2. Still locked: raise a ticket to OBT support.",
+                        "Priya")
     assert not [x for x in kb.sme_queue("NORAM") if x["question"] == "obt login issue"]
+    # the agents get the SME's answer at once ...
+    assert "reset the password" in kb.sme_replies_for("a1", unseen_only=True)[0]["sme_reply"]
+    kb.mark_replies_seen("a1")
+    assert not kb.sme_replies_for("a1", unseen_only=True)
+    # ... but Vidya does not use it until an admin approves it
+    assert "reset the password" not in kb.ask("NORAM", "obt login issue", "a9")["answer"]
+    assert [r["id"] for r in kb.pending_approvals("NORAM")] == [lid]
+    kb.approve(lid, "Admin Ravi")
     for q in ("obt login issue", "traveller not able to login obt"):
         r = kb.ask("NORAM", q, "a3")
         assert r["result"] == "answered" and "reset the password" in r["answer"]
         assert r["sources"][0]["title"] == "SME / process team answer" and not r["meta"]["sme_review"]
-    assert not [x for x in kb.sme_queue("NORAM") if "obt" in x["question"]]       # not sent again
+    left = [x for x in kb.sme_queue("NORAM") if "obt" in x["question"]]           # approved answer: not sent again
+    assert all(x["users"] == ["a9"] for x in left)               # (only the question asked before approval)
     assert _doc_counts() == before                                                   # SOPs untouched
     with pytest.raises(ValueError):
         kb.sme_answer([1], "NORAM", "q", "  ", "Priya")
@@ -382,7 +392,9 @@ def test_low_confidence_goes_to_sme_and_can_be_confirmed(monkeypatch):
     assert r["result"] == "answered" and r["meta"]["sme_review"]
     g = [g for g in kb.sme_queue("NORAM") if g["question"] == "what is TTP"][0]
     assert g["reasons"][0].startswith("Low confidence (")
-    kb.sme_confirm(g["ids"], "Priya")
+    lid = kb.sme_confirm(g["ids"], "Priya")
+    assert "correct" in kb.sme_replies_for("a1")[0]["sme_reply"]
+    kb.approve(lid, "Admin Ravi")
     r2 = kb.ask("NORAM", "what is TTP", "a2")
     assert r2["meta"]["learned"] and not r2["meta"]["sme_review"]    # SME-confirmed answer is not re-queued
     monkeypatch.setattr(config, "SME_REVIEW_BELOW_PCT", 0)
@@ -429,6 +441,8 @@ def test_live_chat_saves_answers_for_next_time():
     assert len(pairs) == 1 and "FFAA1234567" in pairs[0]["answer"] and "Hi" not in pairs[0]["answer"]
     pairs[0]["question"] = "How to add a frequent flyer number in Sabre"
     assert kb.save_chat_pairs(cid, pairs, "Priya") == 1 and not kb.chats_to_review(sme="Priya")
+    assert "FFAA1234567" not in kb.ask("NORAM", "add frequent flyer number sabre", "Ravi")["answer"]   # not yet
+    kb.approve(kb.pending_approvals("NORAM")[0]["id"], "Admin")
     r = kb.ask("NORAM", "add frequent flyer number sabre", "Ravi")
     assert r["result"] == "answered" and "FFAA1234567" in r["answer"]
     texts = [m["text"] for m in kb.chat_messages(cid)]
@@ -867,3 +881,103 @@ def test_no_plane_left_in_the_screens():
     for f in ("ui.py", "app.py", "config.py", "admin_pages.py"):
         assert "\u2708" not in (here / f).read_text(encoding="utf-8"), f
     assert (here / "assets" / "vidya_hero.webp").exists() and (here / "assets" / "vidya_icon.webp").exists()
+
+
+# ---------------------------------------------------------------------------
+# v5.3: admin approval, SME reply to agent only, voting rule (same for good and bad), activity log
+# ---------------------------------------------------------------------------
+def test_reply_to_agent_only_never_enters_memory():
+    q = kb.ask("NORAM", "obt login issue", "a1")
+    kb.sme_answer([q["id"]], "NORAM", "obt login issue", "Call the OBT helpdesk on extension 4455.", "Priya",
+                  to_vidya=False)
+    assert "4455" in kb.sme_replies_for("a1")[0]["sme_reply"]
+    assert not kb.pending_approvals() and "4455" not in kb.ask("NORAM", "obt login issue", "a2")["answer"]
+
+
+def test_rejected_answer_never_used_and_logged():
+    q = kb.ask("NORAM", "obt login issue", "a1")
+    lid = kb.sme_answer([q["id"]], "NORAM", "obt login issue", "Wrong steps 7788", "Priya")
+    with pytest.raises(ValueError):
+        kb.approve(lid, "Admin", answer="  ")
+    kb.reject(lid, "Admin Ravi", "Not our process")
+    assert "7788" not in kb.ask("NORAM", "obt login issue", "a2")["answer"]
+    log = {r["#"]: r for r in kb.approval_log()}[lid]
+    assert log["Status"] == "Rejected" and log["Submitted by"] == "Priya" and log["Decided by"] == "Admin Ravi"
+    with pytest.raises(ValueError):
+        kb.approve(lid, "Admin")                                  # already decided
+
+
+def test_sme_edit_waits_for_admin():
+    lid = kb.teach("NORAM", "q1", "old answer", "Admin")
+    new = kb.update_learned(lid, "q1", "new answer", "Priya", is_admin=False)
+    assert kb.sme_answers("NORAM")[0]["answer"] == "old answer"             # old one still in use
+    kb.approve(new, "Admin")
+    rows = {r["id"]: r for r in kb.list_learned("NORAM")}
+    assert rows[new]["answer"] == "new answer" and lid not in rows        # old one replaced
+
+
+def _vote(qid, helpful, voter, role="Agent"):
+    return kb.give_feedback(qid, helpful, role=role, voter=voter)
+
+
+def test_voting_rule_good_needs_10_agents_80pct_and_2_smes():
+    ids = [kb.ask("NORAM", "how to process refund", f"agent{i}")["id"] for i in range(12)]
+    for i in range(9):
+        assert _vote(ids[i], True, f"agent{i}") == "not enough votes"
+    assert not kb.pending_approvals()
+    _vote(ids[9], True, "agent9")                                          # 10 agents, but no SMEs yet
+    assert not kb.pending_approvals()
+    _vote(ids[10], True, "sme1", "SME")
+    assert _vote(ids[11], True, "sme2", "SME") == "good"
+    p = kb.pending_approvals("NORAM")
+    assert len(p) == 1 and p[0]["kind"] == "Staff votes" and "👍10" in p[0]["vote_info"]
+    assert not [l for l in kb.list_learned("NORAM", "auto")]              # not used until approved
+
+
+def test_voting_rule_bad_same_rule_and_one_thumbs_down_changes_nothing():
+    lid = kb.teach("NORAM", "obt login issue", "Use the old portal 9911", "Admin")
+    r = kb.ask("NORAM", "obt login issue", "a0")
+    assert "9911" in r["answer"]
+    assert _vote(r["id"], False, "a0") == "not enough votes"               # one 👎: still in use ...
+    assert {l["id"]: l for l in kb.list_learned("NORAM")}[lid]["active"] == 1
+    assert any(g["question"] == "obt login issue" for g in kb.sme_queue("NORAM"))   # ... but an SME sees it
+    for i in range(1, 10):
+        _vote(kb.ask("NORAM", "obt login issue", f"a{i}")["id"], False, f"a{i}")
+    assert {l["id"]: l for l in kb.list_learned("NORAM")}[lid]["active"] == 1  # 10 agents, no SMEs: no change
+    for s_ in ("sme1", "sme2"):
+        verdict = _vote(kb.ask("NORAM", "obt login issue", s_)["id"], False, s_, "SME")
+    assert verdict == "bad" and {l["id"]: l for l in kb.list_learned("NORAM")}[lid]["active"] == 0
+
+
+def test_mixed_votes_change_nothing():
+    c = {"agent_up": 7, "agent_down": 5, "sme_up": 2, "sme_down": 0}
+    assert kb.vote_verdict(c) == "mixed"
+    assert kb.vote_verdict({"agent_up": 9, "agent_down": 0, "sme_up": 5, "sme_down": 0}) == "not enough votes"
+
+
+def test_activity_log_and_reports():
+    kb.log("Ravi", "Signed in", region="NORAM", role="Admin")
+    data = b"Refund steps: 1. open the PNR 2. check the fare rule."
+    kb.add_document("NORAM", "SOP", "Log test SOP", "log_test.txt", data, "Ravi")
+    doc = [d for d in kb.list_documents("NORAM") if d["title"] == "Log test SOP"][0]
+    kb.set_document_status(doc["id"], "Archived", by="Ravi")
+    kb.delete_document(doc["id"], by="Ravi")
+    q = kb.ask("NORAM", "obt login issue", "a1")
+    kb.sme_answer([q["id"]], "NORAM", "obt login issue", "Reset the password.", "Priya")
+    kb.approve(kb.pending_approvals()[0]["id"], "Ravi")
+    act = kb.activity_df()
+    acts = set(act["Action"])
+    assert {"Signed in", "Document uploaded", "Document set to Archived", "Document deleted", "Question asked",
+            "SME replied to agent", "Sent to admin for approval", "Approved"} <= acts
+    up = act[(act["Action"] == "Document uploaded") & (act["Item"] == "Log test SOP")].iloc[0]
+    assert up["User"] == "Ravi" and up["Role"] == "Admin" and up["When"]
+    assert "Uploaded by" in kb.documents_report().columns
+    import openpyxl
+    wb = openpyxl.load_workbook(io.BytesIO(kb.reports_excel()))
+    assert {"Activity log", "Questions asked", "Documents", "Approvals", "Votes", "SME activity"} <= set(wb.sheetnames)
+
+
+def test_card_numbers_masked_in_log():
+    kb.log("Amit", "Feedback 👎", "card 4929123456789012", "4929123456789012")
+    row = kb.activity_df(include_questions=False).iloc[0]
+    assert "4929123456789012" not in row["Item"] + row["Detail"]

@@ -178,9 +178,14 @@ MAX_ANSWER_WORDS = 60     # "short" answers stay under this many words
 CONF_BANDS = {"high": (80, 98), "medium": (60, 79), "low": (20, 59)}
 
 # ---- Self-learning --------------------------------------------------------
-AUTO_LEARN = True         # save answers that staff mark 👍 as "auto-learned"
-AUTO_LEARN_MIN_VOTES = 2  # 👍 from this many DIFFERENT people before an answer is auto-learned
-                          # (an admin's 👍 counts as enough on its own)
+AUTO_LEARN = True         # answers with enough 👍 are SENT TO THE ADMIN for approval (never added directly)
+# Voting rule - the SAME rule for good (👍) and bad (👎). Below it, votes change nothing either way.
+FEEDBACK_MIN_VOTES = 10       # at least this many DIFFERENT agents must have rated the answer
+FEEDBACK_MIN_SME_VOTES = 2    # ... and at least this many SMEs (or admins) on the same side
+FEEDBACK_AGREE_PCT = 80       # ... and at least this % of all votes on the same side
+AUTO_LEARN_MIN_VOTES = FEEDBACK_MIN_VOTES   # kept for older code that reads this name
+FEEDBACK_GOOD_BOOST = 1.5     # an answer source voted GOOD moves up in search
+FEEDBACK_BAD_FACTOR = 0.4     # an answer source voted BAD moves down (a learned answer is switched off)
 FEEDBACK_SIMILARITY = 0.55  # how similar a new question must be to reuse past 👍/👎
 
 # ---- AI providers ----------------------------------------------------------
